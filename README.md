@@ -40,6 +40,14 @@ python script.py
 
 The script regenerates `covid_world_map.html` using the latest dataset available from the source URL.
 
+## Deployment
+
+This repository includes a GitHub Pages workflow in `.github/workflows/deploy-pages.yml`.
+
+- On every push to `main`, GitHub Actions publishes `covid_world_map.html` as a static site.
+- After GitHub Pages is enabled for the repository, the public URL should be:
+  `https://diksha159457.github.io/covid-data-visualization/`
+
 ## Resume Value
 
 This project demonstrates data wrangling, basic geospatial visualization, and exporting analysis results into a shareable interactive HTML artifact.
