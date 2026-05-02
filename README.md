@@ -2,6 +2,9 @@
 
 An advanced static analytics dashboard built on top of public Our World in Data COVID-19 datasets. The project now combines global KPI cards, a choropleth, country rankings, vaccination comparisons, and six-month trend charts into a single GitHub Pages-friendly artifact.
 
+## Preview
+
+![COVID-19 Dashboard Preview](assets/COVID-19 Global Analytics.png)
 ## Highlights
 
 - Pulls current global and country-level COVID-19 data from Our World in Data
