@@ -4,7 +4,7 @@ An advanced static analytics dashboard built on top of public Our World in Data 
 
 ## Preview
 
-![COVID-19 Dashboard Preview](assets/COVID-19 Global Analytics.png)
+![COVID-19 Dashboard Preview](assets/dashboard-preview.png)
 ## Highlights
 
 - Pulls current global and country-level COVID-19 data from Our World in Data
