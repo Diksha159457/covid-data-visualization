@@ -1,39 +1,108 @@
+"""Build a self-contained COVID-19 dashboard (``covid_world_map.html``).
+
+By default the build reads the versioned snapshot in ``data/`` so the output
+is reproducible: the upstream OWID and datasets/covid-19 repositories are
+archived and their URLs may disappear. ``--refresh`` re-downloads the sources
+and rewrites the snapshot.
+"""
+
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
 import pandas as pd
 
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data"
+LATEST_SNAPSHOT = DATA_DIR / "owid_latest.csv"
+HISTORY_SNAPSHOT = DATA_DIR / "history_tracked.csv"
+VACCINATION_SNAPSHOT = DATA_DIR / "vaccinations_last_reported.csv"
+VACCINATIONS_URL = "https://raw.githubusercontent.com/owid/covid-19-data/master/public/data/vaccinations/vaccinations.csv"
+LATEST_COLUMNS = [
+    "iso_code", "continent", "location", "last_updated_date", "total_cases", "total_deaths",
+    "total_cases_per_million", "total_deaths_per_million", "people_vaccinated",
+    "people_fully_vaccinated_per_hundred", "population",
+]
 
 HISTORY_URL = "https://raw.githubusercontent.com/datasets/covid-19/main/data/countries-aggregated.csv"
 LATEST_URL = "https://raw.githubusercontent.com/owid/covid-19-data/master/public/data/latest/owid-covid-latest.csv"
-OUTPUT_FILE = Path("covid_world_map.html")
+OUTPUT_FILE = ROOT / "covid_world_map.html"
 TRACKED_COUNTRIES = ["United States", "India", "Brazil", "United Kingdom", "France"]
+# datasets/covid-19 and OWID name some countries differently. Without this the
+# United States was silently missing from the trend chart.
+HISTORY_NAME_FIXES = {"US": "United States"}
 
 
-def load_latest_data() -> pd.DataFrame:
-    latest = pd.read_csv(LATEST_URL)
-    latest = latest[~latest["iso_code"].str.startswith("OWID_")].copy()
-    latest = latest[latest["continent"].notna()].copy()
-    latest["population"] = latest["population"].fillna(0)
-    return latest
+def last_reported_vaccinations(raw: pd.DataFrame) -> pd.DataFrame:
+    """Most recent non-null fully-vaccinated rate per country, with its date.
+
+    OWID's 'latest' file only carries values reported on the final day, so
+    countries that stopped reporting earlier showed up as 0% vaccinated.
+    """
+    rows = raw.dropna(subset=["people_fully_vaccinated_per_hundred"]).sort_values("date")
+    last = rows.groupby("iso_code").tail(1)
+    return last.rename(columns={"date": "vaccination_as_of"})[
+        ["iso_code", "people_fully_vaccinated_per_hundred", "vaccination_as_of"]
+    ].reset_index(drop=True)
 
 
-def load_history_data() -> pd.DataFrame:
-    history = pd.read_csv(
-        HISTORY_URL,
-        usecols=["Date", "Country", "Confirmed"],
-        parse_dates=["Date"],
+def download_sources() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Fetch the upstream files, trimmed to what the dashboard uses."""
+    vaccinations = last_reported_vaccinations(
+        pd.read_csv(VACCINATIONS_URL, usecols=["iso_code", "date", "people_fully_vaccinated_per_hundred"])
     )
-    history = history.rename(columns={"Date": "date", "Country": "location", "Confirmed": "confirmed"})
-    history = history[history["location"].isin(TRACKED_COUNTRIES)].copy()
-    history = history.sort_values(["location", "date"])
+    latest = pd.read_csv(LATEST_URL, usecols=LATEST_COLUMNS)
+    history = pd.read_csv(HISTORY_URL, usecols=["Date", "Country", "Confirmed"])
+    history["Country"] = history["Country"].replace(HISTORY_NAME_FIXES)
+    history = history[history["Country"].isin(TRACKED_COUNTRIES)]
+    return latest, history, vaccinations
+
+
+SNAPSHOTS = (LATEST_SNAPSHOT, HISTORY_SNAPSHOT, VACCINATION_SNAPSHOT)
+
+
+def save_snapshot(latest: pd.DataFrame, history: pd.DataFrame, vaccinations: pd.DataFrame) -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    for frame, path in zip((latest, history, vaccinations), SNAPSHOTS, strict=True):
+        frame.to_csv(path, index=False)
+
+
+def load_snapshot() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if not all(path.exists() for path in SNAPSHOTS):
+        raise FileNotFoundError("No data snapshot found; run `python script.py --refresh` first.")
+    latest, history, vaccinations = (pd.read_csv(path) for path in SNAPSHOTS)
+    return latest, history, vaccinations
+
+
+def prepare_latest(raw: pd.DataFrame, vaccinations: pd.DataFrame | None = None) -> tuple[pd.DataFrame, pd.Series]:
+    """Split OWID 'latest' into per-country rows and the World aggregate row."""
+    world = raw.loc[raw["location"] == "World"]
+    if world.empty:
+        raise ValueError("source data has no 'World' row")
+    countries = raw[~raw["iso_code"].astype(str).str.startswith("OWID_") & raw["continent"].notna()].copy()
+    countries["population"] = countries["population"].fillna(0)
+    if vaccinations is not None:
+        countries = countries.drop(columns=["people_fully_vaccinated_per_hundred"]).merge(
+            vaccinations, on="iso_code", how="left"
+        )
+    return countries, world.iloc[0]
+
+
+def prepare_history(raw: pd.DataFrame, population: pd.Series, days: int = 180) -> pd.DataFrame:
+    history = raw.rename(columns={"Date": "date", "Country": "location", "Confirmed": "confirmed"})
+    history["location"] = history["location"].replace(HISTORY_NAME_FIXES)
+    history["date"] = pd.to_datetime(history["date"])
+    history = history[history["location"].isin(TRACKED_COUNTRIES)].sort_values(["location", "date"]).copy()
+    # Cumulative series occasionally get revised downwards; treat negative daily deltas as 0.
     history["new_cases"] = history.groupby("location")["confirmed"].diff().clip(lower=0).fillna(0)
     history["new_cases_7d_avg"] = (
         history.groupby("location")["new_cases"].rolling(window=7, min_periods=1).mean().reset_index(level=0, drop=True)
     )
-    recent_cutoff = history["date"].max() - pd.Timedelta(days=180)
+    # Per-million so a country of 1.4B and one of 67M can share an axis.
+    history["new_cases_7d_per_million"] = history["new_cases_7d_avg"] / history["location"].map(population) * 1e6
+    recent_cutoff = history["date"].max() - pd.Timedelta(days=days)
     return history[history["date"] >= recent_cutoff].copy()
 
 
@@ -49,11 +118,14 @@ def format_number(value: float | int | None) -> str:
     return f"{value:,.0f}"
 
 
-def build_payload() -> dict[str, object]:
-    latest = load_latest_data()
-    history = load_history_data()
-    world = pd.read_csv(LATEST_URL)
-    world_row = world.loc[world["location"] == "World"].iloc[0]
+def build_payload(
+    latest_raw: pd.DataFrame, history_raw: pd.DataFrame, vaccinations: pd.DataFrame | None = None
+) -> dict[str, object]:
+    latest, world_row = prepare_latest(latest_raw, vaccinations)
+    history = prepare_history(history_raw, latest.set_index("location")["population"])
+    missing = set(TRACKED_COUNTRIES) - set(history["location"])
+    if missing:
+        raise ValueError(f"trend data is missing tracked countries: {sorted(missing)}")
 
     top_cases = (
         latest.nlargest(12, "total_cases")[["location", "total_cases", "continent"]]
@@ -62,7 +134,7 @@ def build_payload() -> dict[str, object]:
     )
 
     vaccination_leaders = (
-        latest[latest["population"] >= 20_000_000]
+        latest[(latest["population"] >= 20_000_000) & latest["people_fully_vaccinated_per_hundred"].notna()]
         .nlargest(12, "people_fully_vaccinated_per_hundred")[
             ["location", "people_fully_vaccinated_per_hundred", "continent"]
         ]
@@ -92,7 +164,7 @@ def build_payload() -> dict[str, object]:
     )
 
     trend = (
-        history[["date", "location", "confirmed", "new_cases_7d_avg"]]
+        history[["date", "location", "confirmed", "new_cases_7d_avg", "new_cases_7d_per_million"]]
         .fillna(0)
         .assign(date=history["date"].dt.strftime("%Y-%m-%d"))
         .to_dict(orient="records")
@@ -112,11 +184,17 @@ def build_payload() -> dict[str, object]:
         "choropleth": choropleth,
         "scatter": scatter,
         "trend": trend,
+        "trend_window": {
+            "start": history["date"].min().strftime("%B %Y"),
+            "end": history["date"].max().strftime("%B %d, %Y"),
+        },
     }
 
 
 def render_dashboard(payload: dict[str, object]) -> str:
-    payload_json = json.dumps(payload)
+    # Escape "</" so no data value can close the <script> tag (HTML injection),
+    # and refuse NaN, which is valid Python JSON but not valid JavaScript JSON.
+    payload_json = json.dumps(payload, allow_nan=False).replace("</", "<\\/")
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -332,13 +410,13 @@ def render_dashboard(payload: dict[str, object]) -> str:
 
       <article class="chart-card">
         <h2 class="chart-title">Vaccination Leaders</h2>
-        <p class="chart-copy">Top countries by fully vaccinated population share, filtered to sizable populations.</p>
+        <p class="chart-copy">Top countries (20M+ people) by fully vaccinated share, using each country's last reported figure.</p>
         <div class="plot" id="vaccinations"></div>
       </article>
 
       <article class="chart-card">
         <h2 class="chart-title">Tracked Country Trends</h2>
-        <p class="chart-copy">Six-month rolling seven-day average of new cases for five frequently compared countries.</p>
+        <p class="chart-copy">Seven-day average of new cases per million, five frequently compared countries, over the final six months of the source series (<span id="trendWindow"></span>).</p>
         <div class="plot" id="trend"></div>
       </article>
 
@@ -352,6 +430,7 @@ def render_dashboard(payload: dict[str, object]) -> str:
 
   <script>
     const payload = {payload_json};
+    document.getElementById("trendWindow").textContent = `${{payload.trend_window.start}} – ${{payload.trend_window.end}}`;
     const summary = payload.summary;
 
     document.getElementById("reported-on").textContent = summary.reported_on;
@@ -424,13 +503,13 @@ def render_dashboard(payload: dict[str, object]) -> str:
       mode: "lines",
       name: country,
       x: rows.map(r => r.date),
-      y: rows.map(r => r.new_cases_7d_avg),
-      hovertemplate: `${{country}}<br>%{{x}}<br>7-day average new cases: %{{y:.0f}}<extra></extra>`
+      y: rows.map(r => r.new_cases_7d_per_million),
+      hovertemplate: `${{country}}<br>%{{x}}<br>New cases per million (7-day avg): %{{y:.1f}}<extra></extra>`
     }}));
     Plotly.newPlot("trend", trendTraces, {{
       ...baseLayout,
       xaxis: {{ title: "Date" }},
-      yaxis: {{ title: "7-day average new cases", gridcolor: "rgba(148,163,184,0.12)" }}
+      yaxis: {{ title: "New cases per million (7-day avg)", gridcolor: "rgba(148,163,184,0.12)" }}
     }}, {{ responsive: true }});
 
     Plotly.newPlot("scatter", [{{
@@ -441,7 +520,7 @@ def render_dashboard(payload: dict[str, object]) -> str:
       text: payload.scatter.map(d => d.location),
       customdata: payload.scatter.map(d => [d.continent, d.people_fully_vaccinated_per_hundred]),
       marker: {{
-        size: payload.scatter.map(d => Math.max(10, Math.sqrt(d.population / 1000000) * 4)),
+        size: payload.scatter.map(d => Math.min(48, Math.max(8, Math.sqrt(d.population / 1000000) * 1.6))),
         color: payload.scatter.map(d => d.people_fully_vaccinated_per_hundred),
         colorscale: "Viridis",
         line: {{ color: "rgba(255,255,255,0.18)", width: 1 }},
@@ -451,18 +530,29 @@ def render_dashboard(payload: dict[str, object]) -> str:
       hovertemplate: "<b>%{{text}}</b><br>Continent: %{{customdata[0]}}<br>Cases per million: %{{x:.0f}}<br>Deaths per million: %{{y:.0f}}<br>Fully vaccinated / 100: %{{customdata[1]:.1f}}<extra></extra>"
     }}], {{
       ...baseLayout,
-      xaxis: {{ title: "Cases per million", gridcolor: "rgba(148,163,184,0.12)" }},
-      yaxis: {{ title: "Deaths per million", gridcolor: "rgba(148,163,184,0.12)" }}
+      xaxis: {{ title: "Cases per million", gridcolor: "rgba(148,163,184,0.12)", rangemode: "tozero" }},
+      yaxis: {{ title: "Deaths per million", gridcolor: "rgba(148,163,184,0.12)", rangemode: "tozero" }}
     }}, {{ responsive: true }});
   </script>
 </body>
 </html>"""
 
 
-def main() -> None:
-    payload = build_payload()
-    OUTPUT_FILE.write_text(render_dashboard(payload), encoding="utf-8")
-    print(f"Saved advanced dashboard to {OUTPUT_FILE.resolve()}")
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--refresh", action="store_true", help="re-download sources and update data/")
+    parser.add_argument("--output", type=Path, default=OUTPUT_FILE)
+    args = parser.parse_args(argv)
+
+    if args.refresh:
+        sources = download_sources()
+        save_snapshot(*sources)
+        print(f"Snapshot updated in {DATA_DIR}")
+    else:
+        sources = load_snapshot()
+
+    args.output.write_text(render_dashboard(build_payload(*sources)), encoding="utf-8")
+    print(f"Saved dashboard to {args.output.resolve()}")
 
 
 if __name__ == "__main__":
